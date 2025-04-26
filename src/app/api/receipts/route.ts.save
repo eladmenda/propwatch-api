@@ -1,0 +1,60 @@
+// src/app/api/receipts/route.ts
+import { NextResponse } from 'next/server'
+import crypto from 'crypto'
+import { sbAdmin } from '@/lib/supabase'
+import { uploadJSON } from '@/lib/arweavimport { ReceiptSchema } from '@/lib/receipt'
+
+export async function POST(request: Request) {
+  // Parse & validate incoming JSON
+  let data
+  try {
+    data = ReceiptSchema.parse(await request.json())
+  } catch (err: any) {
+    return NextResponse.json(
+      { error: 'Invalid payload: ' + err.message },
+      { status: 400 }
+    )
+  }
+
+  // Compute a unique receipt ID
+  const rid = crypto
+    .createHash('sha256')
+    .update(
+      `${data.trader}|${data.firm}|${data.amount_usd}|${new Date().toISOString()}`
+    )
+    .digest('hex')
+
+  // 1) Insert base record in Supabase
+  const { error: insertErr } = await sbAdmin
+    .from('receipts')
+    .insert({ rid, ...data })
+  if (insertErr) {
+    console.error('DB insert error', insertErr)
+    return NextResponse.json(
+      { error: 'Database insert failed' },
+      { status: 500 }
+    )
+  }
+
+  // 2) Backup to Arweave
+  let arweave_txid: string
+  try {
+    arweave_txid = await uploadJSON({ rid, ...data })
+  } catch (err: any) {
+    console.error('Arweave upload error', err)
+    return NextResponse.json(
+      { error: 'Backup to Arweave failed' },
+      { status: 502 }
+    )
+  }
+
+  // 3) Update the row with the txid
+  const { error: updateErr } = await sbAdmin
+    .from('receipts')
+    .update({ arweave_txid })
+    .eq('rid', rid)
+  if (updateErr) console.warn('Failed to update txid:', updateErr)
+
+  // 4) Return the IDs
+  return NextResponse.json({ rid, arweave_txid }, { status: 200 })
+}
